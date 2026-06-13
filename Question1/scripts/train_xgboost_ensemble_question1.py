@@ -15,7 +15,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 QUESTION_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAINING_FILE = QUESTION_ROOT / "train_for_question1.csv"
-DEFAULT_VALIDATION_FILE = QUESTION_ROOT / "2026年1-3月_拼接排序.xlsx"
+DEFAULT_VALIDATION_FILE = QUESTION_ROOT / "validate_for_question1.xlsx"
 DEFAULT_OUTPUT_DIR = QUESTION_ROOT / "outputs" / "xgboost_ensemble"
 
 TARGET_COLUMN = "NTU"
@@ -197,12 +197,12 @@ def build_xgboost_model(n_estimators: int):
         objective="reg:squarederror",
         n_estimators=1000,
         learning_rate=0.01,
-        max_depth=3,
+        max_depth=2,
         min_child_weight=3,
         subsample=0.85,
         colsample_bytree=0.85,
         reg_alpha=0.1,
-        reg_lambda=1.0,
+        reg_lambda=2.0,
         random_state=42,
         n_jobs=-1,
     )
