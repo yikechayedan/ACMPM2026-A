@@ -1,10 +1,7 @@
-"""Extract potential abnormal points from Question 1 data.
+"""Extract rolling robust z-score candidates from Question 1 data.
 
-The script reports candidate abnormal observations instead of modifying the
-source data. It combines three checks:
-1. physical range rules;
-2. global IQR fences;
-3. rolling-window robust z-scores for isolated spikes.
+The script reports rolling/Hampel-style local spike candidates for manual
+review. It does not modify the source data.
 """
 
 from __future__ import annotations
@@ -61,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--iqr-multiplier",
         type=float,
-        default=1.5,
-        help="IQR fence multiplier. Default: 1.5",
+        default=2.0,
+        help="Monthly IQR fence multiplier. Kept for compatibility; not used in the default output.",
     )
     parser.add_argument(
         "--rolling-window",
@@ -80,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         "--include-missing",
         action="store_true",
         help="Also output missing numeric values as candidate records.",
+    )
+    parser.add_argument(
+        "--include-iqr",
+        action="store_true",
+        help="Deprecated compatibility flag. Rolling candidates are always the only output.",
     )
     return parser.parse_args()
 
@@ -230,49 +232,57 @@ def detect_iqr_outliers(
 
     for col in columns:
         series = pd.to_numeric(df[col], errors="coerce")
-        clean = series.dropna()
-        if clean.empty:
-            continue
+        month_series = df["datetime"].dt.to_period("M")
 
-        q1 = clean.quantile(0.25)
-        q3 = clean.quantile(0.75)
-        iqr = q3 - q1
-        lower = q1 - multiplier * iqr
-        upper = q3 + multiplier * iqr
-        mask = series.notna() & ((series < lower) | (series > upper))
+        for month, month_index in month_series.groupby(month_series).groups.items():
+            month_series_values = series.loc[month_index]
+            clean = month_series_values.dropna()
+            if clean.empty:
+                continue
 
-        stats.append(
-            {
-                "column": col,
-                "count": int(series.notna().sum()),
-                "missing": int(series.isna().sum()),
-                "mean": clean.mean(),
-                "std": clean.std(),
-                "q1": q1,
-                "median": clean.median(),
-                "q3": q3,
-                "iqr": iqr,
-                "iqr_lower": lower,
-                "iqr_upper": upper,
-                "iqr_outlier_count": int(mask.sum()),
-            }
-        )
-
-        if iqr == 0:
-            continue
-
-        for row_index, value in series[mask].items():
-            add_record(
-                records,
-                df,
-                row_index,
-                col,
-                value,
-                "iqr",
-                f"outside [{lower:.6g}, {upper:.6g}]",
-                lower=lower,
-                upper=upper,
+            q1 = clean.quantile(0.25)
+            q3 = clean.quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - multiplier * iqr
+            upper = q3 + multiplier * iqr
+            mask = month_series_values.notna() & (
+                (month_series_values < lower) | (month_series_values > upper)
             )
+
+            stats.append(
+                {
+                    "column": col,
+                    "month": str(month),
+                    "count": int(month_series_values.notna().sum()),
+                    "missing": int(month_series_values.isna().sum()),
+                    "mean": clean.mean(),
+                    "std": clean.std(),
+                    "q1": q1,
+                    "median": clean.median(),
+                    "q3": q3,
+                    "iqr": iqr,
+                    "iqr_lower": lower,
+                    "iqr_upper": upper,
+                    "iqr_outlier_count": int(mask.sum()),
+                }
+            )
+
+            for row_index, value in month_series_values[mask].items():
+                if iqr == 0:
+                    reason = f"different from monthly constant baseline {q1:.6g} in {month}"
+                else:
+                    reason = f"outside monthly {month} fence [{lower:.6g}, {upper:.6g}]"
+                add_record(
+                    records,
+                    df,
+                    row_index,
+                    col,
+                    value,
+                    "monthly_iqr",
+                    reason,
+                    lower=lower,
+                    upper=upper,
+                )
 
     return records, stats
 
@@ -286,12 +296,27 @@ def detect_rolling_spikes(
     for col in columns:
         series = pd.to_numeric(df[col], errors="coerce")
         rolling_median = series.rolling(window=window, center=True, min_periods=3).median()
-        residual = (series - rolling_median).abs()
-        rolling_mad = residual.rolling(window=window, center=True, min_periods=3).median()
-        robust_z = 0.6745 * residual / rolling_mad.replace(0, pd.NA)
+        deviations = (series - rolling_median).abs()
+
+        def median_absolute_deviation(values: pd.Series) -> float:
+            clean = values.dropna()
+            if clean.empty:
+                return pd.NA
+            local_median = clean.median()
+            return (clean - local_median).abs().median()
+
+        rolling_mad = series.rolling(window=window, center=True, min_periods=3).apply(
+            median_absolute_deviation,
+            raw=False,
+        )
+        robust_z = 0.6745 * deviations / rolling_mad.replace(0, pd.NA)
         mask = robust_z.notna() & (robust_z > threshold)
 
         for row_index, value in series[mask].items():
+            local_median = rolling_median.at[row_index]
+            local_ratio = pd.NA
+            if pd.notna(local_median) and local_median != 0:
+                local_ratio = value / local_median
             add_record(
                 records,
                 df,
@@ -302,6 +327,8 @@ def detect_rolling_spikes(
                 f"isolated spike versus local median, threshold={threshold}",
                 score=robust_z.at[row_index],
             )
+            records[-1]["local_median"] = local_median
+            records[-1]["local_ratio"] = local_ratio
 
     return records
 
@@ -357,7 +384,7 @@ def build_iqr_and_rolling_intersection(outliers: pd.DataFrame) -> pd.DataFrame:
             ]
         )
 
-    target = outliers[outliers["method"].isin(["iqr", "rolling_robust_z"])].copy()
+    target = outliers[outliers["method"].isin(["monthly_iqr", "rolling_robust_z"])].copy()
     if target.empty:
         return pd.DataFrame()
 
@@ -367,7 +394,7 @@ def build_iqr_and_rolling_intersection(outliers: pd.DataFrame) -> pd.DataFrame:
         .reset_index(name="method_set")
     )
     both_keys = method_sets[
-        method_sets["method_set"].map(lambda methods: {"iqr", "rolling_robust_z"}.issubset(methods))
+        method_sets["method_set"].map(lambda methods: {"monthly_iqr", "rolling_robust_z"}.issubset(methods))
     ][["row_index", "column"]]
 
     if both_keys.empty:
@@ -417,6 +444,36 @@ def build_iqr_and_rolling_intersection(outliers: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+def build_rolling_spikes(outliers: pd.DataFrame) -> pd.DataFrame:
+    if outliers.empty:
+        return pd.DataFrame()
+
+    rolling = outliers[outliers["method"] == "rolling_robust_z"].copy()
+    if rolling.empty:
+        return rolling
+
+    return (
+        rolling[
+            [
+                "excel_row",
+                "row_index",
+                "datetime",
+                "date",
+                "time",
+                "column",
+                "value",
+                "local_median",
+                "local_ratio",
+                "score",
+                "remarks",
+            ]
+        ]
+        .rename(columns={"score": "rolling_score"})
+        .sort_values(["datetime", "column"])
+        .reset_index(drop=True)
+    )
+
+
 def build_notes() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -437,9 +494,8 @@ def build_notes() -> pd.DataFrame:
             {
                 "item": "iqr",
                 "description": (
-                    "Flags values outside Q1 - k*IQR and Q3 + k*IQR. For skewed water "
-                    "quality variables, true high-turbidity operating periods can also "
-                    "be flagged and should not be deleted mechanically."
+                    "Flags values outside monthly Q1 - k*IQR and Q3 + k*IQR. Monthly "
+                    "fences reduce the effect of strong seasonal level shifts."
                 ),
             },
             {
@@ -458,11 +514,26 @@ def build_notes() -> pd.DataFrame:
                 ),
             },
             {
+                "item": "rolling_candidates",
+                "description": (
+                    "The rolling_candidates sheet keeps all points flagged by the local "
+                    "Hampel-style rolling robust z-score. It can detect local low/high "
+                    "spikes that global IQR misses due to seasonal level shifts. This is "
+                    "the primary manual review list."
+                ),
+            },
+            {
                 "item": "iqr_and_rolling",
                 "description": (
-                    "The iqr_and_rolling sheet keeps only points flagged by both IQR and "
-                    "rolling robust z-score. These are higher-priority candidates for "
-                    "manual review."
+                    "The iqr_and_rolling sheet is kept only as a strict reference. It "
+                    "can miss local anomalies in high/low seasonal periods."
+                ),
+            },
+            {
+                "item": "include_iqr",
+                "description": (
+                    "Monthly IQR-only candidates are excluded from potential_outliers by "
+                    "default. Use --include-iqr when an IQR-only reference is needed."
                 ),
             },
         ]
@@ -474,41 +545,23 @@ def main() -> None:
     df = load_data(args.input)
     columns = numeric_columns(df)
 
-    records: list[dict] = []
-    records.extend(detect_physical_rule_outliers(df, columns))
-    iqr_records, column_stats = detect_iqr_outliers(df, columns, args.iqr_multiplier)
-    records.extend(iqr_records)
-    records.extend(
-        detect_rolling_spikes(
-            df,
-            columns,
-            window=args.rolling_window,
-            threshold=args.rolling_z_threshold,
-        )
+    rolling_records = detect_rolling_spikes(
+        df,
+        columns,
+        window=args.rolling_window,
+        threshold=args.rolling_z_threshold,
     )
-    if args.include_missing:
-        records.extend(detect_missing_values(df, columns))
-
-    outliers = pd.DataFrame(records)
-    if not outliers.empty:
-        outliers = outliers.sort_values(["datetime", "column", "method"]).reset_index(drop=True)
-
-    iqr_and_rolling = build_iqr_and_rolling_intersection(outliers)
-    summary = summarize_records(records)
-    stats = pd.DataFrame(column_stats).sort_values("column")
+    rolling_candidates = build_rolling_spikes(pd.DataFrame(rolling_records))
+    if not rolling_candidates.empty:
+        rolling_candidates = rolling_candidates.sort_values(["datetime", "column"]).reset_index(drop=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
-        outliers.to_excel(writer, sheet_name="potential_outliers", index=False)
-        iqr_and_rolling.to_excel(writer, sheet_name="iqr_and_rolling", index=False)
-        summary.to_excel(writer, sheet_name="summary", index=False)
-        stats.to_excel(writer, sheet_name="column_stats", index=False)
-        build_notes().to_excel(writer, sheet_name="notes", index=False)
+        rolling_candidates.to_excel(writer, sheet_name="rolling_candidates", index=False)
 
     print(f"Input rows: {len(df)}")
     print(f"Checked numeric columns: {len(columns)}")
-    print(f"Potential outlier records: {len(outliers)}")
-    print(f"IQR and rolling robust z-score intersection: {len(iqr_and_rolling)}")
+    print(f"Rolling robust z-score candidates: {len(rolling_candidates)}")
     print(f"Output: {args.output}")
 
 

@@ -11,6 +11,9 @@ __pycache__/
 parsed/
 outputs/
 exports/
+*.joblib
+*.aux
+*.log
 
 # Office temporary files
 ~*.xls
